@@ -59,6 +59,51 @@ not typed are converted to type T. This model has the following parameters and d
     jiang_zeta       = 1.19
 end
 
+@with_kw struct CIB_Chiang{T<:Real} <: AbstractCIBModel{T} @deftype T
+    nside::Int64    = 4096
+    min_redshift = 0.0
+    max_redshift = 5.0
+    min_mass     = 1e12
+    box_size     = 40000
+
+    # Chiang T_d distribution parameters
+    chiang_mu0::T      = 2.55
+    chiang_Cmu::T      = 0.59
+    chiang_sT::T       = 0.04
+    chiang_alphaT::T   = 4.99
+
+    # Chiang beta distribution parameters
+    chiang_beta0::T    = 1.71
+    chiang_Cbeta::T    = 0.34
+    chiang_sigmaBeta::T = 0.71 # This is sigma_beta, variance is sigma_beta^2
+
+    # Chiang rho_d(z) evolution parameters (if implementing)
+    chiang_log10a::T   = 5.14
+    chiang_b::T        = 1.59
+    chiang_c::T        = 2.82
+    chiang_d::T        = 6.51
+
+    # shang HOD
+    shang_zplat  = 2.0
+    shang_Td     = 20.7
+    shang_beta   = 1.6
+    shang_eta    = 2.4
+    shang_alpha  = 0.2
+    shang_Mpeak  = 10^12.3
+    shang_sigmaM = 0.3
+    shang_Msmin  = 1e11
+    shang_Mmin   = 1e10
+    shang_I0     = 92
+
+    # jiang
+    jiang_gamma_1    = 0.13
+    jiang_alpha_1    = -0.83
+    jiang_gamma_2    = 1.33
+    jiang_alpha_2    = -0.02
+    jiang_beta_2     = 5.67
+    jiang_zeta       = 1.19
+end
+
 @with_kw struct CIB_Scarfy{T<:Real} <: AbstractCIBModel{T} @deftype T
     nside::Int64    = 4096
     min_redshift = 0.0
@@ -104,6 +149,108 @@ end
     jiang_zeta       = 1.19
 end
 
+"""
+    sample_beta(z::T, model::CIB_Chiang{T}, rng::AbstractRNG=Random.GLOBAL_RNG) where T<:Real
+
+Sample dust spectral index beta from a Gaussian distribution with redshift-dependent mean.
+"""
+function sample_beta(z::T, model::CIB_Chiang{T}, rng::AbstractRNG=Random.GLOBAL_RNG) where T<:Real
+    # Calculate redshift-dependent mean beta
+    mean_beta_z = model.chiang_beta0 + model.chiang_Cbeta * log(one(T) + z)
+
+    # Sample from Normal(mean, sigma^2)
+    # Note: Distributions.Normal takes mean and standard deviation (sigma)
+    beta_sampled = rand(rng, Normal(mean_beta_z, model.chiang_sigmaBeta))
+
+    return beta_sampled
+end
+
+"""
+    sample_Td_metropolis(z::T, model, n_samples::Int; 
+                         burn_in::Int=1000, 
+                         thin::Int=10, 
+                         proposal_std::T=0.1,
+                         rng::AbstractRNG=Random.GLOBAL_RNG) where T<:Real
+
+Sample dust temperature Td using the Metropolis-Hastings algorithm.
+
+Args:
+    z (T): Redshift value
+    model: Model containing chiang parameters
+    n_samples (Int): Number of samples to return
+    burn_in (Int): Number of initial samples to discard
+    thin (Int): Keep every `thin`-th sample to reduce autocorrelation
+    proposal_std (T): Standard deviation for proposal step (in log space)
+    rng (AbstractRNG): Random number generator
+
+Returns:
+    Vector{T}: Sampled dust temperature values
+"""
+function sample_Td_metropolis(z::T, model, n_samples::Int;
+                             burn_in::Int=1000,
+                             thin::Int=10,
+                             proposal_std::T=T(0.1),
+                             rng::AbstractRNG=Random.GLOBAL_RNG) where T<:Real
+    
+    # Calculate model parameters at this redshift
+    mu_T_z = model.chiang_mu0 + model.chiang_Cmu * log(one(T) + z)
+    s_T = model.chiang_sT
+    alpha_T = model.chiang_alphaT
+    
+    # Log-likelihood function (unnormalized)
+    function log_likelihood(T_val::T)
+        if T_val <= zero(T)
+            return -T(Inf)  # Log of zero
+        end
+        
+        lnT = log(T_val)
+        exp_term = exp(alpha_T * mu_T_z + T(0.5) * (alpha_T * s_T)^2)
+        power_term = T_val^(-(one(T) + alpha_T))
+        erfc_arg = (one(T) / sqrt(T(2))) * (alpha_T * s_T - (lnT - mu_T_z) / s_T)
+        erfc_term = erfc(erfc_arg)
+        
+        # Return log-likelihood (ignoring constants that cancel out)
+        return log(max(exp_term * power_term * erfc_term, eps(T)))
+    end
+    
+    # Initialize chain with a reasonable starting point
+    # Starting from exp(mu_T_z) which should be in high-density region
+    current_T = exp(mu_T_z)
+    current_log_like = log_likelihood(current_T)
+    
+    # Storage for samples (after burn-in and thinning)
+    total_iterations = burn_in + thin * n_samples
+    samples = Vector{T}(undef, n_samples)
+    
+    # Metropolis-Hastings sampling
+    sample_idx = 1
+    for i in 1:total_iterations
+        # Propose new value in log space (ensures T > 0)
+        log_current = log(current_T)
+        log_proposal = log_current + proposal_std * randn(rng, T)
+        proposal_T = exp(log_proposal)
+        
+        # Calculate acceptance probability
+        proposal_log_like = log_likelihood(proposal_T)
+        log_acceptance_ratio = proposal_log_like - current_log_like
+        
+        # Accept or reject
+        if log(rand(rng, T)) < log_acceptance_ratio
+            current_T = proposal_T
+            current_log_like = proposal_log_like
+        end
+        
+        # Store sample after burn-in and thinning
+        if i > burn_in && (i - burn_in) % thin == 0
+            samples[sample_idx] = current_T
+            sample_idx += 1
+        end
+    end
+    
+    return samples
+end
+
+
 function jiang_shmf(m, M_halo, model)
     dndm = (((model.jiang_gamma_1*((m/M_halo)^model.jiang_alpha_1))+
              (model.jiang_gamma_2*((m/M_halo)^model.jiang_alpha_2)))*
@@ -138,7 +285,7 @@ function build_shang_interpolator(
     return linear_interpolation(x_m, N_sat_i)
 end
 
-function sigma_cen(m::T, model::CIB_Planck2013) where T
+function sigma_cen(m::T, model::AbstractCIBModel) where T
     return (exp( -(log10(m) - log10(model.shang_Mpeak))^2 /
         (T(2)*model.shang_sigmaM) ) * m) / sqrt(T(2π) * model.shang_sigmaM)
 end
@@ -157,6 +304,17 @@ function nu2theta(nu::T, z::T, model::AbstractCIBModel) where T
     return xnu^(T(4) + model.shang_beta) / expm1(xnu) / nu / model.shang_I0
 end
 
+# redshift is unnecessary for CIB_Chiang model. Td will be sampled from a
+# Td(z) distribution. Similarly, beta will be sampled from a beta(z) distribution.
+# Note: Julia does multiple dispatch ordered by specificality, 
+# e.g., CIB_Chiang > AbstractCIBModel
+function nu2theta(nu::T, Td::T, beta::T, model::CIB_Chiang) where T
+    phys_h = T(6.62606957e-27)
+    phys_k = T(1.3806488e-16)
+    xnu = phys_h * nu / phys_k / Td
+    return xnu^(T(4) + beta) / expm1(xnu) / nu / model.shang_I0 # TODO: Revisit normalization.
+end
+
 function build_muofn_interpolator(model;
         min_mu::T=-6.0f0, max_mu::T=0.0f0, nbin=1000) where T
     mu = T(10) .^ LinRange(min_mu, max_mu, nbin)
@@ -171,7 +329,7 @@ end
 """
 Compute redshift evolution factor for LF.
 """
-function z_evo(z::T, model::CIB_Planck2013) where T
+function z_evo(z::T, model::AbstractCIBModel) where T
     return (one(T) + min(z, model.shang_zplat))^model.shang_eta
 end
 
@@ -208,7 +366,7 @@ end
 """
 Construct the necessary interpolator set.
 """
-function get_interpolators(model::CIB_Planck2013, cosmo::Cosmology.FlatLCDM{T},
+function get_interpolators(model::AbstractCIBModel, cosmo::Cosmology.FlatLCDM{T},
     min_halo_mass::T, max_halo_mass::T) where T
     return (
         r2z = build_r2z_interpolator(
@@ -410,6 +568,35 @@ function fill_fluxes!(nu_obs, model::AbstractCIBModel{T}, sources,
     end
 end
 
+function fill_fluxes!(nu_obs, model::CIB_Chiang{T}, sources,
+    fluxes_cen::AbstractArray, fluxes_sat::AbstractArray) where {T}
+
+    # Process centrals
+    Threads.@threads :static for i in 1:sources.N_cen
+        z_cen = sources.redshift_cen[i]
+        # Sample Td and beta for *this* central galaxy
+        Td_sampled = sample_Td_metropolis(z_cen, model, 1)[1]  # not so efficient
+        beta_sampled = sample_beta(z_cen, model)
+
+        nu = (one(T) + z_cen) * nu_obs
+        fluxes_cen[i] = l2f(
+            sources.lum_cen[i] * nu2theta(nu, Td_sampled, beta_sampled, model),
+            sources.dist_cen[i], z_cen)
+    end
+
+    # Process satellites
+    Threads.@threads :static for i in 1:sources.N_sat
+        z_sat = sources.redshift_sat[i]
+        # Sample Td and beta for *this* satellite galaxy
+        Td_sampled = sample_Td_metropolis(z_sat, model, 1)[1]  # not so efficient
+        beta_sampled = sample_beta(z_sat, model)
+
+        nu = (one(T) + z_sat) * nu_obs
+        fluxes_sat[i] = l2f(
+            sources.lum_sat[i] * nu2theta(nu, Td_sampled, beta_sampled, model),
+            sources.dist_sat[i], z_sat)
+    end
+end
 
 """
     paint!(result_map, nu_obs, model, sources, fluxes_cen, fluxes_sat)
