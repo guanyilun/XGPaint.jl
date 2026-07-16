@@ -11,6 +11,7 @@ using PhysicalConstants.CODATA2018
 # Include HEALPix ring workspace tests
 include("test_healpix_rings.jl")
 include("test_ringworkspace.jl")
+include("test_kappa.jl")
 
 # relative background evolutions differ by 1e-3 between Julia and Python 2
 rtol = 1e-3
