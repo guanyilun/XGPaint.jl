@@ -58,3 +58,33 @@ using QuadGK
                  (model.ρm0 * model.z2chi(zs[i])^2) for i in 1:2)
     @test mapint ≈ expint rtol = 1e-2
 end
+
+@testset "kappa compensated profile (Websky overdensity-3 sphere)" begin
+    model = NFWKappaProfile(Omega_c=0.261, Omega_b=0.049, h=0.68)
+    modelc = NFWKappaProfile(Omega_c=0.261, Omega_b=0.049, h=0.68, delta_comp=3.0)
+    M, z = 3e14, 0.7
+
+    # compensation sphere: same total mass at overdensity 3, R = 4.78 r200m > 2 r200m
+    Rc = comp_radius_comoving(modelc, M)
+    @test Rc ≈ cbrt(3 * total_kappa_mass(modelc, M) / (4π * 3 * modelc.ρm0)) rtol = 1e-12
+    @test Rc / r200m_comoving(modelc, M) ≈ cbrt(1.636 * 200 / 3) rtol = 1e-2
+    @test comp_radius_comoving(model, M) == 0
+
+    # paint radius covers the (larger) compensation sphere
+    θmax = XGPaint.compute_θmax(modelc, M, z)
+    @test θmax ≈ Rc / modelc.z2chi(z) rtol = 1e-12
+
+    # net projected mass is zero: ∫κ_comp(θ)2πθdθ ≈ 0 (to a tiny fraction of the
+    # uncompensated integral); NFW cusp positive at center, negative wings outside
+    intc, _ = quadgk(θ -> modelc(θ, M, z) * 2π * θ, 0.0, θmax, rtol=1e-9)
+    intu, _ = quadgk(θ -> model(θ, M, z) * 2π * θ, 0.0, θmax, rtol=1e-9)
+    @test abs(intc) < 3e-3 * intu
+    @test modelc(1e-6, M, z) > 0
+    @test modelc(0.9 * θmax, M, z) < 0
+
+    # inside the NFW region the compensated profile is the plain one minus the sphere
+    θtest = 0.3 * XGPaint.compute_θmax(model, M, z)
+    b = θtest * modelc.z2chi(z)
+    expected = model(θtest, M, z) - lensing_kernel(modelc, z) * 3 * 2 * sqrt(Rc^2 - b^2)
+    @test modelc(θtest, M, z) ≈ expected rtol = 1e-10
+end

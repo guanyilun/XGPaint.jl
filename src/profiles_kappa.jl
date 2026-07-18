@@ -37,6 +37,9 @@ struct NFWKappaProfile{T,C,I1,I2} <: AbstractGNFW{T}
     ρm0::T      # comoving mean matter density [Msun/Mpc³]
     z2chi::I1   # z → comoving distance [Mpc]
     gx::I2      # log(x) → dimensionless projected profile g(x), x = R⊥/r_s
+    Δcomp::T    # >0: subtract a uniform sphere of the SAME total mass at this mean
+                # overdensity (Websky §3.2.1/§3.2.4 uses 3) — the halo map then adds
+                # zero net mass, compensating the full-matter LPT field map
 end
 
 """
@@ -49,14 +52,21 @@ Evaluate as `model(θ, M200m_Msun, z)` (θ in radians); paint with the standard
 `paint!(map, workspace, model, masses, redshifts, αs, δs)`.
 """
 function NFWKappaProfile(; Omega_c::T=0.2589, Omega_b::T=0.0486, h::T=0.6774,
-                         cnfw::T=7.0, xmax::T=2.0, z_star=1089.0, z_max=6.0) where {T<:Real}
+                         cnfw::T=7.0, xmax::T=2.0, z_star=1089.0, z_max=6.0,
+                         delta_comp::T=0.0) where {T<:Real}
     OmegaM = Omega_b + Omega_c
     cosmo = get_cosmology(T, h=h, OmegaM=OmegaM)
     χstar = T(ustrip(u"Mpc", Cosmology.comoving_radial_dist(u"Mpc", cosmo, z_star)))
     ρm0 = T(2.77536627e11) * OmegaM * h^2   # Msun/Mpc³, comoving
     z2chi = build_z2r_interpolator(T(0.0), T(z_max), cosmo)
     gx = _build_nfw_kappa_gx(T, cnfw, xmax)
-    return NFWKappaProfile(cosmo, cnfw, xmax, χstar, ρm0, z2chi, gx)
+    return NFWKappaProfile(cosmo, cnfw, xmax, χstar, ρm0, z2chi, gx, delta_comp)
+end
+
+"comoving radius [Mpc] of the compensation sphere: total painted mass at overdensity Δcomp"
+function comp_radius_comoving(model::NFWKappaProfile, M_Msun)
+    model.Δcomp > 0 || return zero(M_Msun)
+    return cbrt(3 * total_kappa_mass(model, M_Msun) / (4π * model.Δcomp * model.ρm0))
 end
 
 # dimensionless density in r_s units: NFW inside c, (c/u)² tail to xmax·c, zero beyond
@@ -105,18 +115,31 @@ function convergence(model::NFWKappaProfile{T}, θ, M_Msun, z) where T
     r200 = r200m_comoving(model, M_Msun)
     rs = r200 / model.cnfw
     x = max(θ, eps(T)) * χ / rs
-    x >= model.xmax * model.cnfw && return zero(T)
-    g = max(model.gx(log(x)), zero(T))
-    ρs_over_ρm = 200 * model.cnfw^3 / (3 * f_nfw(model.cnfw))   # ρ_s/ρ̄_m for NFW at Δ=200m
-    return lensing_kernel(model, z) * ρs_over_ρm * rs * g
+    Σ_over_ρm = zero(T)                    # comoving projected overdensity column [Mpc]
+    if x < model.xmax * model.cnfw
+        g = max(model.gx(log(x)), zero(T))
+        ρs_over_ρm = 200 * model.cnfw^3 / (3 * f_nfw(model.cnfw))   # ρ_s/ρ̄_m at Δ=200m
+        Σ_over_ρm += ρs_over_ρm * rs * g
+    end
+    if model.Δcomp > 0
+        Rc = comp_radius_comoving(model, M_Msun)
+        b = max(θ, eps(T)) * χ
+        if b < Rc
+            Σ_over_ρm -= model.Δcomp * 2 * sqrt(Rc^2 - b^2)
+        end
+    end
+    return lensing_kernel(model, z) * Σ_over_ρm
 end
 
 # evaluation functions never take Unitful inputs; θ in radians, mass in Msun (M200m)
 (model::NFWKappaProfile)(θ, M_Msun, z) = convergence(model, θ, M_Msun, z)
 
-# the profile is exactly zero beyond xmax·r200m, so the paint radius is known analytically
+# the profile is exactly zero beyond xmax·r200m (or the compensation sphere radius,
+# ≈4.8·r200m for Δcomp=3, whichever is larger), so the paint radius is analytic
 # (the generic compute_θmax uses 4×R200c, which over-covers by ~35%)
 function compute_θmax(model::NFWKappaProfile{T}, M_Δ, z; mult=1) where T
     M_Msun = M_Δ isa Unitful.Mass ? ustrip(u"Msun", M_Δ) : M_Δ
-    return T(mult * model.xmax * r200m_comoving(model, M_Msun) / model.z2chi(z))
+    Rmax = max(model.xmax * r200m_comoving(model, M_Msun),
+               comp_radius_comoving(model, M_Msun))
+    return T(mult * Rmax / model.z2chi(z))
 end
